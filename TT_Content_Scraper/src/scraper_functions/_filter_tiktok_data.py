@@ -162,8 +162,6 @@ def _filter_tiktok_data(data_slot):
         video_metadata["diversification_labels"] = None
     ## diversification_id --> bigint
     video_metadata["diversification_id"] = data_slot.get("diversificationId", None)
-    ## CategoryType --> bigint
-    video_metadata["category_type"] = data_slot.get("CategoryType", None)
     ## channel_tags --> character varying(250)[]
     video_metadata["channel_tags"] = data_slot.get("channelTags", None) # is it really tied to the author?
     if video_metadata["channel_tags"] == {}:
@@ -178,8 +176,6 @@ def _filter_tiktok_data(data_slot):
     video_metadata["ai_gc_description"] = data_slot.get("AIGCDescription", None)
     if video_metadata["ai_gc_description"] == '':
         video_metadata["ai_gc_description"] = None
-    ## creator_ai_comment --> json
-    video_metadata["creator_ai_comment"] = data_slot.get("creatorAIComment", None)
 
     # ---
 
@@ -191,10 +187,6 @@ def _filter_tiktok_data(data_slot):
     file_metadata["filepath"] = None #specified later
     ## duration --> integer
     file_metadata["duration"] = data_slot.get("video", {}).get("duration", None)
-    ## cover --> string
-    file_metadata["cover"] = data_slot.get("video", {}).get("cover", None)
-    ## subtitle_infos --> json[]
-    file_metadata["subtitle_infos"] = data_slot.get("video", {}).get("subtitleInfos", None) or []
     ## height --> integer
     file_metadata["height"] = data_slot.get("video", {}).get("height", None)
     ## width --> integer
@@ -281,7 +273,6 @@ def _filter_tiktok_data(data_slot):
 
     # combine all
     filtered_metadata = {}
-    filtered_metadata["aweme_id"] = _force_to_int(data_slot.get("id", None))
     filtered_metadata["video_metadata"] = video_metadata
     filtered_metadata["file_metadata"] = file_metadata
     filtered_metadata["music_metadata"] = music_metadata

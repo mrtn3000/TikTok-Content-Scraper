@@ -21,10 +21,17 @@ class TT_Content_Scraper(ObjectTracker):
                 output_files_fp = "data/",
                 progress_file_fn = "progress_tracking/scraping_progress.db",
                 clear_console = False,
-                browser_name = None):
-        
+                browser_name = None,
+                proxy = None,
+    ):
         # initialize object tracker (database of pending and finished objects (ids))
         super().__init__(progress_file_fn)
+
+        if browser_name:
+            base_scraper.set_browser(browser_name)
+
+        if proxy:
+            base_scraper.set_proxy(proxy)
 
         # create output folder if doesnt exist
         Path(output_files_fp).mkdir(parents=True, exist_ok=True)
@@ -113,7 +120,7 @@ class TT_Content_Scraper(ObjectTracker):
                 binaries : dict = base_scraper.scrape_binaries(link_to_binaries)
             except ConnectionError as e:
                 logger.warning(f"ID {id} did not lead to any downloadable files - KeyError {e}")
-                self.mark_error(id=id)
+                self.mark_error(id, str(e))
                 self.n_errors_total += 1
                 self.n_pending -= 1
                 return None
@@ -124,10 +131,6 @@ class TT_Content_Scraper(ObjectTracker):
                 sorted_metadata["file_metadata"]["is_slide"] = False
                 self._write_video(video_content=binaries["mp4"],
                                   filename=Path(self.output_files_fp, "content_files/", f"tiktok_video_{id}.mp4"))
-                # also save audio for Whisper transcription
-                if binaries["mp3"]:
-                    self._write_audio(audio_content=binaries["mp3"],
-                                      filename=Path(self.output_files_fp, "content_files/", f"tiktok_audio_{id}.mp3"))
             # if slide (with music) available
             elif binaries["jpegs"]:
                 sorted_metadata["file_metadata"]["is_slide"] = True
@@ -137,20 +140,6 @@ class TT_Content_Scraper(ObjectTracker):
                 if binaries["mp3"]:
                     self._write_audio(audio_content=binaries["mp3"],
                                             filename=Path(self.output_files_fp, "content_files/", f"tiktok_audio_{id}.mp3"))
-
-            # download cover image if available
-            if binaries.get("cover"):
-                self._write_cover(cover_url=binaries["cover"],
-                                  filename=Path(self.output_files_fp, "content_files/", f"tiktok_cover_{id}.jpeg"))
-
-            # write subtitles
-            for subtitle in binaries.get("subtitles") or []:
-                ext = {"webvtt": "vtt", "srt": "srt"}.get(subtitle["format"], subtitle["format"] or "vtt")
-                lang = subtitle["language_code"] or "unknown"
-                source = subtitle["source"] or "unknown"
-                self._write_subtitle(content=subtitle["content"],
-                                     filename=Path(self.output_files_fp, "content_files/",
-                                                   f"tiktok_subtitle_{id}_{lang}_{source}.{ext}"))
 
         self._write_metadata_package(sorted_metadata, filepath)
         self.mark_completed(id, filepath)
@@ -217,20 +206,3 @@ class TT_Content_Scraper(ObjectTracker):
         with open(filename, "wb") as f:
             f.write(audio_content)
         logger.debug(f"▼ MP3  saved to {filename}")
-
-    def _write_subtitle(self, content, filename):
-        with open(filename, "wb") as f:
-            f.write(content)
-        logger.debug(f"▼ Subtitle saved to {filename}")
-
-    def _write_cover(self, cover_url, filename):
-        try:
-            response = requests.get(cover_url, timeout=20)
-            if response.status_code == 200:
-                with open(filename, "wb") as f:
-                    f.write(response.content)
-                logger.debug(f"▼ Cover saved to {filename}")
-            else:
-                logger.warning(f"▼ Failed to download cover: HTTP {response.status_code}")
-        except Exception as e:
-            logger.warning(f"▼ Error downloading cover: {str(e)}")

@@ -1,4 +1,5 @@
 import json
+import requests
 
 def _download_data(self, metadata_batch, download_metadata = True, download_content = True):
     for metadata_package in metadata_batch:
@@ -6,22 +7,26 @@ def _download_data(self, metadata_batch, download_metadata = True, download_cont
 
         # in case a video or slides where scraped:
         if content_binary and download_content:
-            
+
             # pictures / slides
             if content_binary["type"] == "slide":
                 self.write_pictures(content_binary["slide_pictures"], metadata_package["file_metadata"]["filepath"])
                 self.write_slide_audio(content_binary["slide_audio"], metadata_package["file_metadata"]["filepath"])
-            
+
             # videos
             elif content_binary["type"] == "video":
                 self.write_video(content_binary["mp4_binary"], metadata_package["file_metadata"]["filepath"])
+
+            # download cover image if available
+            if content_binary.get("cover_url"):
+                self.write_cover(content_binary["cover_url"], metadata_package["file_metadata"]["filepath"])
 
         # save metadata
         if download_metadata:
             self.write_metadata_package(metadata_package["file_metadata"]["filepath"], metadata_package)
         else:
             return metadata_package
-    
+
     return None
 
 def write_metadata_package(self, filepath, metadata_package):
@@ -50,3 +55,16 @@ def write_slide_audio(self, slide_audio, filepath):
         with open(filename, "wb") as f:
             f.write(slide_audio)
         self.log.info(f"--> MP3 saved to {filename}")
+
+def write_cover(self, cover_url, filepath):
+    filename = filepath.replace("*", "cover.jpeg")
+    try:
+        response = requests.get(cover_url)
+        if response.status_code == 200:
+            with open(filename, "wb") as f:
+                f.write(response.content)
+            self.log.info(f"--> Cover image saved to {filename}")
+        else:
+            self.log.warning(f"--> Failed to download cover image: HTTP {response.status_code}")
+    except Exception as e:
+        self.log.warning(f"--> Error downloading cover image: {str(e)}")

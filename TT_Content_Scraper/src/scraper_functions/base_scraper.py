@@ -19,9 +19,16 @@ class RetryLaterError(Exception):
      """Something could not be scraped, maybe later..."""
      pass
 
+class RateLimitError(Exception):
+    """HTTP 429 Too Many Requests from TikTok."""
+    pass
+
+class ForbiddenError(Exception):
+    """HTTP 403 Forbidden from TikTok (may indicate IP/account block)."""
+    pass
+
 class BaseScraper():
-    def __init__(self, browser_name = None, proxy=None):
-        self.proxy = proxy
+    def __init__(self, browser_name = None):
         self.headers = {
             'Accept-Encoding': 'gzip, deflate, sdch',
             'Accept-Language': 'en-US,en;q=0.8',
@@ -33,14 +40,10 @@ class BaseScraper():
             'referer' : 'https://www.tiktok.com/'
         }   
         self.cookies = dict()
-    
-    def set_browser(self, browser_name) -> None:
-        self.cookies = getattr(browser_cookie3, browser_name)(domain_name='.tiktok.com')  # Inspired by pyktok
 
-    def set_proxy(self, proxy) -> None:
-        self.proxy = proxy
-        return
-
+        if browser_name:
+            self.cookies = getattr(browser_cookie3, browser_name)(domain_name='.tiktok.com')  # Inspired by pyktok
+            
     def request_and_retain_cookies(self, url, retain = True) -> requests.Response:
             
             response = requests.get(url,
@@ -48,9 +51,7 @@ class BaseScraper():
                     headers=self.headers,
                     cookies=self.cookies,
                     timeout=20,
-                    stream=False,
-                    proxies=self.proxy
-            )
+                    stream=False)
             
             # retain any new cookies that got set in this request
             if retain:
@@ -58,12 +59,16 @@ class BaseScraper():
 
             return response
 
-    def scrape_metadata(self, video_id) -> dict:
+    def scrape_metadata(self, video_id, fetch_ai_summary=True) -> dict:
 
         retries = 0
         script_tag = None
         while script_tag is None and retries <= 3:
             response = self.request_and_retain_cookies(url=f"https://www.tiktok.com/@tiktok/video/{video_id}")
+            if response.status_code == 429:
+                raise RateLimitError(f"HTTP 429 fetching video {video_id}")
+            if response.status_code == 403:
+                raise ForbiddenError(f"HTTP 403 fetching video {video_id}")
             soup = BeautifulSoup(response.text, "html.parser")
             script_tag = soup.find('script', id="__UNIVERSAL_DATA_FOR_REHYDRATION__")
 
@@ -79,22 +84,33 @@ class BaseScraper():
         metadata = data["__DEFAULT_SCOPE__"]["webapp.video-detail"]["itemInfo"]["itemStruct"]
         sorted_metadata = _filter_tiktok_data(data_slot=metadata)
 
+        # Fetch AI summary from custom TDK API
+        if fetch_ai_summary:
+            ai_summary = self._fetch_custom_tdk(video_id)
+            if ai_summary:
+                sorted_metadata["video_metadata"]["ai_summary"] = ai_summary
+
         # find link to binary of slide (pictures), music or video file
         images_binaries_addr = metadata.get('imagePost', None)
         if images_binaries_addr: images_binaries_addr = images_binaries_addr.get("images", None)
-        
+
         audio_binary_addr = metadata.get('music', None)
         if audio_binary_addr: audio_binary_addr = audio_binary_addr.get("playUrl", None)
-        
+
         video_binary_addr = metadata.get('video', None)
         if video_binary_addr: video_binary_addr = video_binary_addr.get("playAddr", None)
         if video_binary_addr == '':
             video_binary_addr = metadata.get('video', None).get("downloadAddr", None)
 
+        cover_url = metadata.get('video', {}).get('cover', None)
+        subtitle_infos = metadata.get('video', {}).get('subtitleInfos', None) or []
+
         link_to_binaries = {
             "mp4" : video_binary_addr,
             "mp3" : audio_binary_addr,
-            "jpegs" : images_binaries_addr
+            "jpegs" : images_binaries_addr,
+            "cover" : cover_url,
+            "subtitles" : subtitle_infos
             }
 
         return sorted_metadata, link_to_binaries
@@ -128,8 +144,17 @@ class BaseScraper():
         return user_data
 
     def scrape_binaries(self, links) -> dict:
-        audio_binary = None
+        # Video: 403 is a permanent TikTok restriction, not a transient error.
+        # Try once; if it returns 403 / ConnectionError, log and continue without video.
         video_binary = None
+        if links["mp4"]:
+            try:
+                video_binary = self._scrape_video(links["mp4"])
+            except ConnectionError:
+                logger.warning("--> Video URL returned 403 — video will not be saved")
+
+        # Audio, pictures and subtitles: retry up to 3 times on transient network errors.
+        audio_binary = None
         picture_content_binary = None
         retries = 0
 
@@ -137,30 +162,44 @@ class BaseScraper():
             try:
                 if links["mp3"]:
                     audio_binary = self._scrape_audio(links["mp3"])
-                if links["mp4"]:
-                    video_binary = self._scrape_video(links["mp4"])
                 if links["jpegs"]:
                     metadata_images = links["jpegs"]
                     logger.info("-> is slide with {} pictures".format(len(metadata_images)))
                     picture_content_binary = (len(metadata_images)) * [None]
                     for i in range(len(metadata_images)):
                         tt_pic_url = metadata_images[i]["imageURL"]["urlList"][0]
-                        # metadata_images[i].pop("imageURL")
-                        # picture_formats = metadata_images
-
                         pic_binary = self._scrape_picture(tt_pic_url)
                         picture_content_binary[i] = pic_binary
-                
-                return {"mp3": audio_binary,
-                        "mp4": video_binary,
-                        "jpegs": picture_content_binary}
+                break  # success
             except (requests.exceptions.ChunkedEncodingError, ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, ssl.SSLError, requests.exceptions.SSLError) as e:
                 logger.warning(f"{e} - retrying max. 3 times with 0.5s sleep in between")
                 time.sleep(0.1)
                 retries += 1
                 continue
-        
-        raise ConnectionError
+        else:
+            raise ConnectionError("Audio/picture download failed after 3 retries")
+
+        # Subtitles: small text files, download independently (not retried as a batch)
+        subtitles = []
+        for sub_info in links.get("subtitles") or []:
+            url = sub_info.get("Url")
+            if url:
+                try:
+                    content = self._scrape_subtitle(url)
+                    subtitles.append({
+                        "content": content,
+                        "language_code": sub_info.get("LanguageCodeName"),
+                        "source": sub_info.get("Source"),
+                        "format": sub_info.get("Format"),
+                    })
+                except Exception as e:
+                    logger.warning(f"--> Failed to download subtitle {sub_info.get('LanguageCodeName')}: {e}")
+
+        return {"mp3": audio_binary,
+                "mp4": video_binary,
+                "jpegs": picture_content_binary,
+                "cover": links.get("cover"),
+                "subtitles": subtitles}
 
 
     def _scrape_video(self, url):
@@ -190,5 +229,40 @@ class BaseScraper():
         tt_audio = self.request_and_retain_cookies(url, retain=False)
         if str(tt_audio) == "<Response [403]>":
             raise ConnectionError
-        else: 
+        else:
             return tt_audio.content
+
+    def _scrape_subtitle(self, url):
+        response = self.request_and_retain_cookies(url, retain=False)
+        if str(response) == "<Response [403]>":
+            raise ConnectionError
+        return response.content
+
+    def _fetch_custom_tdk(self, aweme_id):
+        """
+        Fetches custom TDK data from TikTok's API, which includes AI-generated summaries.
+
+        Parameters
+        ----------
+        aweme_id : str or int
+            The TikTok video ID (AWEME_ID)
+
+        Returns
+        -------
+        str or None
+            The itemCustomTDK payload if available, otherwise None
+        """
+        try:
+            url = f"https://www.tiktok.com/api/customtdk/item/?aid=1988&itemId={aweme_id}"
+            response = self.request_and_retain_cookies(url, retain=False)
+            if response.status_code == 200:
+                data = response.json()
+                if "itemCustomTDK" in data:
+                    ai_summary = data["itemCustomTDK"]
+                    if ai_summary:
+                        logger.info(f"--> Custom TDK AI summary found for video {aweme_id}")
+                        return ai_summary
+            return None
+        except Exception as e:
+            logger.warning(f"--> Error fetching custom TDK data: {str(e)}")
+            return None
